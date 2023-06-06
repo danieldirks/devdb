@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+
+#set -o errexit
+set -o pipefail
+set -o nounset
+[[ -n ${DEBUG:-} ]] && set -o xtrace
+
+SUCCESS_SYMBOL="\033[0;32m\xE2\x9C\x94\033[0m "
+ERROR_SYMBOL="\033[0;31m\xe2\x9c\x98\033[0m "
+INFO_SYMBOL="\033[0;33m\xe2\x9d\xb1\033[0m "
+WAIT_SYMBOL="\033[0;34m#\033[0m "
+
+
+##########################
+### DATABASE TEMPLATES ###
+##########################
+
+SUPPORTED_BASES=('mysql', 'mariadb', 'postgres')
+function get_base {
+    if [[ -n $(head $1 | grep -i 'mysql') ]]; then
+        BASE='mysql'
+    elif [[ -n $(head $1 | grep -i 'mariadb') ]]; then
+        BASE='mariadb'
+    elif [[ -n $(head $1 | grep -i 'postgres') ]]; then
+        BASE='postgres'
+    fi
+}
+
+function create_mysql {
+    INTERNAL_PORT=3306
+    EXTERNAL_PORT=${EXTERNAL_PORT:-$INTERNAL_PORT}
+    read -r -d '\0' DOCKERFILE <<- EOM
+FROM mysql:8
+
+COPY $FILE /docker-entrypoint-initdb.d/
+RUN echo "CREATE USER IF NOT EXISTS '$USER' IDENTIFIED BY '$PASSWORD';" > /docker-entrypoint-initdb.d/user.sql
+RUN echo "GRANT ALL ON *.* TO '$USER';" >> /docker-entrypoint-initdb.d/user.sql
+
+ENV MYSQL_RANDOM_ROOT_PASSWORD=true
+
+EXPOSE $INTERNAL_PORT
+
+HEALTHCHECK --interval=10s --timeout=10s --start-period=20s --retries=20 CMD mysql -u $USER -p$PASSWORD
+CMD ["mysqld", "--sql-mode="]\0
+EOM
+}
+
+function create_mariadb {
+    INTERNAL_PORT=3306
+    EXTERNAL_PORT=${EXTERNAL_PORT:-$INTERNAL_PORT}
+    read -r -d '\0' DOCKERFILE <<- EOM
+FROM mariadb:10
+
+COPY $FILE /docker-entrypoint-initdb.d/
+RUN echo "CREATE USER IF NOT EXISTS '$USER' IDENTIFIED BY '$PASSWORD';" > /docker-entrypoint-initdb.d/user.sql
+RUN echo "GRANT ALL ON *.* TO '$USER';" >> /docker-entrypoint-initdb.d/user.sql
+
+ENV MARIADB_RANDOM_ROOT_PASSWORD=true
+
+EXPOSE $INTERNAL_PORT
+
+HEALTHCHECK --interval=10s --timeout=10s --start-period=20s --retries=20 CMD mysql -u $USER -p$PASSWORD
+CMD ["mysqld", "--sql-mode="]\0
+EOM
+}
+
+function create_postgres {
+    INTERNAL_PORT=5432
+    EXTERNAL_PORT=${EXTERNAL_PORT:-$INTERNAL_PORT}
+    read -r -d '\0' DOCKERFILE <<- EOM
+FROM postgres:15-alpine
+
+COPY $FILE /docker-entrypoint-initdb.d/
+
+ENV POSTGRES_USER=$USER
+ENV POSTGRES_PASSWORD=$PASSWORD
+
+EXPOSE $INTERNAL_PORT
+
+HEALTHCHECK --interval=10s --timeout=10s --start-period=20s --retries=20 CMD psql -U $USER -c "SELECT 1"\0
+EOM
+}
+
+function create_composefile {
+    read -r -d '\0' COMPOSEFILE <<- EOM
+services:
+  db:
+    build: ./db
+    ports:
+      - "$EXTERNAL_PORT:$INTERNAL_PORT"\0
+EOM
+}
+
+
+############
+### HELP ###
+############
+
+read -r -d '\0' HELP_TEXT <<- EOM
+Usage: $0 [args] <setup-file>
+       $0 <command> [args]
+
+Args:
+  -p, --port <port>          Manually set port. Uses database default if not set.
+  -d, --detached             Starts container in background.
+  -b, --base <dbms>          Manually set database. Tries to determine from file if not set.
+                             Supported: ${SUPPORTED_BASES[@]}
+  -f, --force                Overwrite existing databases.
+  -u, --user <user>          Manually set database user. Default is devdb.
+  -P, --password <password>  Manually set database password. Default is devdb.
+  --to-docker <file.zip>     Create a zip containing docker build files.
+  --to-compose <file.zip>    Create a zip containing docker-compose files.
+
+Commands:
+  help              This text.
+  rm|remove <name>  Removes database with given name.\0
+EOM
+
+
+#################
+### FUNCTIONS ###
+#################
+
+function highlight {
+    echo -e "\033[0;34m$1\033[0m"
+}
+
+function check_docker {
+    echo -ne "${WAIT_SYMBOL} Checking docker..."
+    if ! command -v docker &> /dev/null; then
+        echo -e "\r\e[0K${ERROR_SYMBOL} Docker not found.\n\nMore information on installing docker can be found at https://docs.docker.com/get-docker/."
+        exit 1
+    else
+        if docker ps &> /dev/null ; then
+            echo -e "\r\e[0K${SUCCESS_SYMBOL} Docker found."
+        else
+            echo -e "\r\e[0K${ERROR_SYMBOL} Docker connection failed.\n\nCheck that docker is running and accessible as user $(highlight $(whoami))."
+            exit 1
+        fi
+    fi
+}
+
+
+############
+### MAIN ###
+############
+
+if [[ $# -lt 1 ]]; then
+    echo "$HELP_TEXT"
+    exit 1
+fi
+
+### HELP ###
+if [[ $1 = 'help' ]]; then
+    echo "$HELP_TEXT"
+    exit
+
+### REMOVE ###
+elif [[ $1 = 'rm' || $1 = 'remove' ]]; then
+    shift
+
+    # check docker requirement
+    check_docker
+
+    # check name
+    if [[ ! $@ = devdb_* ]]; then
+        echo -e "\r\e[0K${ERROR_SYMBOL} Name has to start with \"$(highlight devdb_)\"."
+        exit 1
+    fi
+
+    # set name
+    SERVER_NAME=$@
+
+    # remove container
+    echo -ne "${WAIT_SYMBOL} Removing $(highlight $SERVER_NAME)..."
+    if [[ -n $(docker ps -a | grep $SERVER_NAME) ]]; then
+        OUTPUT=$(docker rm -f $SERVER_NAME 2>&1)
+        if [[ $? -eq 0 ]]; then
+            echo -e "\r\e[0K${SUCCESS_SYMBOL} $(highlight $SERVER_NAME) removed."
+        else
+            echo -e "\r\e[0K${ERROR_SYMBOL} Removing $(highlight $SERVER_NAME) failed.\n\n$(highlight "Last command:") docker rm -f $SERVER_NAME\n$OUTPUT"
+        fi
+    else
+        echo -e "\r\e[0K${INFO_SYMBOL} $(highlight $SERVER_NAME) does not exist. Nothing to do."
+    fi
+    exit
+
+### CREATE ###
+else
+    # set defaults
+    BASE=''
+    INTERNAL_PORT=0
+    EXTERNAL_PORT=
+    USER='devdb'
+    PASSWORD='devdb'
+    INPUT_NAME=''
+    DOCKERFILE=''
+    COMPOSEFILE=''
+    DETACHED=0
+    OVERWRITE=0
+    TO_DOCKER=''
+    TO_COMPOSE=''
+
+    # parse arguments
+    _ARGS=''
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -b|--base)
+                BASE="$2"
+                shift; shift
+                ;;
+            -p|--port)
+                EXTERNAL_PORT="$2"
+                shift; shift
+                ;;
+            -u|--user)
+                USER="$2"
+                shift; shift
+                ;;
+            -P|--password)
+                PASSWORD="$2"
+                shift; shift
+                ;;
+            -f|--forced)
+                OVERWRITE=1
+                shift
+                ;;
+            -d|--detached)
+                DETACHED=1
+                shift
+                ;;
+            --to-docker)
+                TO_DOCKER="$2"
+                shift; shift
+                ;;
+            --to-compose)
+                TO_COMPOSE="$2"
+                shift; shift
+                ;;
+            -*|--*)
+                echo "${ERROR_SYMBOL} Unknown argument $1"
+                exit 1
+                ;;
+            *)
+                _ARGS+="$1"
+                shift
+                ;;
+            esac
+    done
+
+    # catch missing file
+    FILE=$_ARGS
+    if [[ -z "$FILE" ]]; then
+        echo "$HELP_TEXT"
+        exit 1
+    fi
+
+    # catch files not in current directory
+    if [[ $FILE =~ ^../ ]] || [[ $FILE =~ ^/ ]] ; then
+        echo -e "${ERROR_SYMBOL} $FILE: File has to be a relative path in the current directory."
+        exit 1
+    fi
+
+    # catch unreadable file
+    if [[ ! -f "$FILE" ]]; then
+        echo -e "${ERROR_SYMBOL} $FILE: Can not open file."
+        exit 1
+    fi
+
+    # check if output files exist
+    if [[ -n $TO_DOCKER ]] && [[ -f $TO_DOCKER ]]; then
+        echo -e "${ERROR_SYMBOL} $TO_DOCKER: File already exists."
+        exit 1
+    fi
+    if [[ -n $TO_COMPOSE ]] && [[ -f $TO_COMPOSE ]]; then
+        echo -e "${ERROR_SYMBOL} $TO_COMPOSE: File already exists."
+        exit 1
+    fi
+
+    # check docker requirement
+    check_docker
+
+    # check zip requirement
+    if [[ -n $TO_DOCKER ]] || [[ -n $TO_COMPOSE ]]; then
+        echo -ne "${WAIT_SYMBOL} Checking zip..."
+        if ! command -v zip &> /dev/null; then
+            echo -e "\r\e[0K${ERROR_SYMBOL} Zip not found.\n\nInstall zip with your package manager."
+            exit 1
+        else
+            echo -e "\r\e[0K${SUCCESS_SYMBOL} Zip found."
+        fi
+    fi
+
+    # find or check correct base template
+    if [[ -z "$BASE" ]]; then
+        echo -ne "${WAIT_SYMBOL} Trying to determine base..."
+        get_base $FILE
+        if [[ -z "$BASE" ]]; then
+            echo -e "\r\e[0K${ERROR_SYMBOL} Could not determin base from file.\n\nplease specify with --base. see help for syntax and supported databases."
+            exit 1
+        else
+            echo -e "\r\e[0K${SUCCESS_SYMBOL} Base $(highlight $BASE) chosen."
+        fi
+    else
+        if [[ -n $(echo "${SUPPORTED_BASES[@]}" | grep "$BASE") ]]; then
+            echo -e "${INFO_SYMBOL} Base $(highlight $BASE) set."
+        else
+            echo -e "${ERROR_SYMBOL} Base $(highlight $BASE) is not supported.\n\nChoose one of ${SUPPORTED_BASES[@]}"
+            exit 1
+        fi
+    fi
+
+    # show port if manually set
+    if [[ -n "$EXTERNAL_PORT" ]]; then
+        echo -e "${INFO_SYMBOL} Port $(highlight $EXTERNAL_PORT) set."
+    fi
+
+    # check name and create dockerfile
+    echo -ne "${WAIT_SYMBOL} Creating definition..."
+    SERVER_NAME="devdb_$BASE"
+    if [[ -n $(docker ps -a | grep $SERVER_NAME) ]]; then
+        if [[ $OVERWRITE -eq 0 ]]; then
+            echo -e "\r\e[0K${ERROR_SYMBOL} $(highlight "$SERVER_NAME") already exists.\n\nTo fix this, you can:\n- remove the existing database: $(highlight "$0 rm $SERVER_NAME")\n- overwrite existing devdb with $(highlight '--force')"
+            exit 1
+        fi
+    fi
+    create_$BASE
+    echo -e "\r\e[0K${SUCCESS_SYMBOL} Definition created."
+
+    # if set export and exit, else build and run
+    if [[ -n $TO_DOCKER ]] || [[ -n $TO_COMPOSE ]]; then
+        # create folder with export files
+        echo -ne "${WAIT_SYMBOL} Creating files..."
+        TEMP_PATH=$SERVER_NAME
+        EXPORT_PATH=${TO_COMPOSE:-$TO_DOCKER}
+        if [[ -n $TO_COMPOSE ]]; then
+        create_composefile
+            OUTPUT=$(mkdir -p $TEMP_PATH/db && echo "$DOCKERFILE" > $TEMP_PATH/db/Dockerfile && cp $FILE $TEMP_PATH/db/$FILE && echo "$COMPOSEFILE" > $TEMP_PATH/docker-compose.yaml 2>&1)
+        elif [[ -n $TO_DOCKER ]]; then
+            OUTPUT=$(mkdir -p $TEMP_PATH && echo "$DOCKERFILE" > $TEMP_PATH/Dockerfile && cp $FILE $TEMP_PATH/$FILE 2>&1)
+        fi
+        if [[ $? -eq 0 ]]; then
+            echo -e "\r\e[0K${SUCCESS_SYMBOL} Files created."
+        else
+            echo -e "\r\e[0K${ERROR_SYMBOL} Files failed.\n\n$(highlight "output:") $OUTPUT"
+            exit 1
+        fi
+
+        # zip files
+        echo -ne "${WAIT_SYMBOL} Creating archive..."
+        if [[ -n $TO_COMPOSE ]]; then
+            OUTPUT=$(zip -r "$EXPORT_PATH" "$TEMP_PATH" 2>&1)
+        elif [[ -n $TO_DOCKER ]]; then
+            OUTPUT=$(zip -r "$EXPORT_PATH" "$TEMP_PATH" 2>&1)
+        fi
+        if [[ $? -eq 0 ]]; then
+            echo -e "\r\e[0K${SUCCESS_SYMBOL} Archive created at $(highlight "$EXPORT_PATH")."
+        else
+            echo -e "\r\e[0K${ERROR_SYMBOL} Creating archive failed.\n\n$(highlight "output:") $OUTPUT"
+        fi
+
+        # delete temporary folder
+        echo -ne "${WAIT_SYMBOL} Cleaning up..."
+        rm -Rf $TEMP_PATH 2>&1
+        echo -e "\r\e[0K${SUCCESS_SYMBOL} Finished."
+
+        # show instructions for docker compose
+        if [[ -n $TO_COMPOSE ]]; then
+            echo -e "${INFO_SYMBOL} Extract the archive and run $(highlight "docker-compose up") inside the directory to start the database locally."
+        fi
+
+        # stop as we only want to export
+        exit
+    fi
+
+    # pull image
+    echo -ne "${WAIT_SYMBOL} Pulling base image... (this may take some time)"
+    OUTPUT=$(docker pull $(echo "$DOCKERFILE" | grep 'FROM' | cut -d' ' -f2) 2>&1)
+    if [[ $? -eq 0 ]]; then
+        echo -e "\r\e[0K${SUCCESS_SYMBOL} Pull complete."
+    else
+        echo -e "\r\e[0K${ERROR_SYMBOL} Pull failed.\n\n$(highlight "last command:") docker pull $(echo "$DOCKERFILE" | grep 'FROM' | cut -d' ' -f2)\n$OUTPUT"
+        exit 1
+    fi
+
+    # build image from dockerfile
+    echo -ne "${WAIT_SYMBOL} Building..."
+    OUTPUT=$(echo "$DOCKERFILE" | docker build -t "$SERVER_NAME" -f - . 2>&1)
+    if [[ $? -eq 0 ]]; then
+        echo -e "\r\e[0K${SUCCESS_SYMBOL} Build complete."
+    else
+        echo -e "\r\e[0K${ERROR_SYMBOL} Build failed.\n\n$(highlight "Last command:") echo <dockerfile truncated> | docker build -t $SERVER_NAME -f - .\n$OUTPUT"
+        exit 1
+    fi
+
+    # remove existing container if force is set
+    if [[ -n $(docker ps -a | grep $SERVER_NAME) ]]; then
+        if [[ $OVERWRITE -eq 1 ]]; then
+            echo -ne "${WAIT_SYMBOL} Removing existing database..."
+            OUTPUT=$(docker rm -f $SERVER_NAME 2>&1)
+            if [[ $? -eq 0 ]]; then
+                echo -e "\r\e[0K${SUCCESS_SYMBOL} Existing database removed."
+            else
+                echo -e "\r\e[0K${ERROR_SYMBOL} Removing existing database failed. Trying to continue."
+            fi
+        fi
+    fi
+
+    # run container
+    echo -ne "${WAIT_SYMBOL} Booting up..."
+    OUTPUT=$(docker run -d --name $SERVER_NAME -p $EXTERNAL_PORT:$INTERNAL_PORT $SERVER_NAME 2>&1)
+    if [[ $? -eq 0 ]]; then
+        echo -e "\r\e[0K${SUCCESS_SYMBOL} Database started."
+    else
+        echo -e "\r\e[0K${ERROR_SYMBOL} Starting failed.\n\n$(highlight "Last command:") docker run -d --name $SERVER_NAME -p $EXTERNAL_PORT:$INTERNAL_PORT $SERVER_NAME\n$OUTPUT"
+        exit 1
+    fi
+
+    # wait for database to be ready
+    echo -ne "${WAIT_SYMBOL} Waiting for database"
+    TRIES=0
+    until [[ $TRIES -eq 12 ]] || [[ -n $(docker ps | grep $SERVER_NAME | grep 'healthy') ]]; do
+        echo -n '.'
+        ((TRIES=TRIES+1))
+        sleep 5
+    done
+
+    # check if database is ready or timeout is reached
+    if [[ $TRIES -eq 12 ]]; then
+        echo -e "\r\e[0K${ERROR_SYMBOL} Database timed out. Try: $(highlight "docker logs $SERVER_NAME")"
+        exit 1
+    else
+        echo -e "\r\e[0K${SUCCESS_SYMBOL} Database running as $(highlight $SERVER_NAME)."
+    fi
+
+    # show connection information
+    echo -e "${INFO_SYMBOL} HOST:$(highlight localhost), PORT:$(highlight $EXTERNAL_PORT), USER:$(highlight $USER), PASSWORD:$(highlight $PASSWORD)"
+ 
+    # show logs and remove database if not detached
+    if [[ $DETACHED -eq 0 ]]; then
+        echo -e "${INFO_SYMBOL} Running in foreground (crtl+c to stop)"
+        docker logs -f --tail 0 $SERVER_NAME
+
+        echo -ne "\n${WAIT_SYMBOL} Removing database..."
+        OUTPUT=$(docker rm -f $SERVER_NAME 2>&1)
+        if [[ $? -eq 0 ]]; then
+            echo -e "\r\e[0K${SUCCESS_SYMBOL} Database removed."
+        else
+            echo -e "\r\e[0K${ERROR_SYMBOL} Removing database failed.\n\n$(highlight "Last command:") docker rm -f $SERVER_NAME\n$OUTPUT"
+            exit 1
+        fi
+    fi
+fi
